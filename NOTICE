@@ -1,0 +1,11 @@
+codex-image for Claude Cowork
+Copyright (c) 2026 Chris Lefevre, MIT License.
+
+This project downloads and patches claude-skill-codex-imagegen
+(https://github.com/JunSeo99/claude-skill-codex-imagegen), MIT License,
+copyright its authors. patches/codex-cli-0.162.patch modifies
+scripts/run_codex_imagegen.py from that project and is distributed under the
+same MIT terms.
+
+Codex CLI is a product of OpenAI. This project is not affiliated with
+Anthropic or OpenAI.

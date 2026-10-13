@@ -1,0 +1,162 @@
+#!/bin/bash
+# codex-image : one stable command that Claude can call to generate images with Codex.
+# Every command prints JSON on stdout so an automation can read the result.
+set -u
+
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$ROOT/lib/common.sh"
+
+die() { printf '{"status": "error", "message": %s}\n' "$(json_escape "$1")"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-image generate BRIEF_FILE|- [--name SLUG] [--out DIR] [--image REF.png] [--plan PLAN.json] [--workers N]
+  codex-image status DIR
+  codex-image wait DIR [SECONDS]        (sleeps at most 25 s, then prints the status)
+  codex-image finish DIR [NAME] [--open]
+  codex-image doctor [--json]
+  codex-image version
+
+BRIEF_FILE is a text file (or - for stdin). It must start with $imagegen; it is added if missing.
+DIR is the folder printed by generate (out_dir).
+EOF
+}
+
+setup_runtime() {
+  CODEX="$(resolve_codex)"
+  [ -n "$CODEX" ] || die "Codex CLI not found. Run: codex-image doctor"
+  V="$(codex_version "$CODEX")"
+  version_ge "$V" "$MIN_CODEX_VERSION" || die "Codex $V is too old (need $MIN_CODEX_VERSION+): $CODEX. Run: codex-image doctor"
+  use_codex "$CODEX"
+  IMAGEGEN="$(find_imagegen_dir)" || die "codex-imagegen skill not found. Run the installer again."
+}
+
+run_dir_of() {
+  local d="$1"
+  [ -d "$d/run" ] && { echo "$d/run"; return; }
+  echo "$d"
+}
+
+cmd_generate() {
+  local brief="" name="image" out="" image="" plan="" workers=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --out) out="$2"; shift 2 ;;
+      --image) image="$2"; shift 2 ;;
+      --plan) plan="$2"; shift 2 ;;
+      --workers) workers="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) if [ -z "$brief" ]; then brief="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  setup_runtime
+  local slug
+  slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')"
+  [ -n "$slug" ] || slug="image"
+  if [ -z "$out" ]; then
+    out="$OUTPUT_ROOT/$(date +%Y-%m-%d)-$slug"
+    local n=2 base="$out"
+    while [ -e "$out" ]; do out="$base-v$n"; n=$((n + 1)); done
+  fi
+  mkdir -p "$out" || die "Cannot create $out"
+
+  local args=(--out-dir "$out/run" --background)
+  if [ -n "$plan" ]; then
+    [ -f "$plan" ] || die "Plan not found: $plan"
+    # Briefs referenced by the plan are resolved next to the plan file.
+    args=(--plan "$plan" "${args[@]}")
+    [ -n "$workers" ] && args+=(--workers "$workers")
+  else
+    [ -n "$brief" ] || die "Missing brief file (use - for stdin)"
+    if [ "$brief" = "-" ]; then cat > "$out/brief.txt"; else
+      [ -f "$brief" ] || die "Brief not found: $brief"
+      [ "$brief" -ef "$out/brief.txt" ] || cp "$brief" "$out/brief.txt"
+    fi
+    if ! head -c 9 "$out/brief.txt" | grep -q '^\$imagegen'; then
+      { printf '$imagegen '; cat "$out/brief.txt"; } > "$out/brief.tmp" && mv "$out/brief.tmp" "$out/brief.txt"
+    fi
+    args=(--prompt-file "$out/brief.txt" "${args[@]}")
+  fi
+  if [ -n "$image" ]; then
+    [ -f "$image" ] || die "Reference image not found: $image"
+    local ref="$out/reference.${image##*.}"
+    [ "$image" -ef "$ref" ] || cp "$image" "$ref"
+    args+=(--image "$ref")
+  fi
+
+  local result
+  result="$(cd "$IMAGEGEN" && python3 scripts/image_project.py "${args[@]}" 2>&1)" || die "image_project.py failed: $result"
+  printf '{"status": "started", "out_dir": %s, "codex": %s, "next": "codex-image wait <out_dir>"}\n' \
+    "$(json_escape "$out")" "$(json_escape "$CODEX ($V)")"
+}
+
+cmd_status() {
+  [ $# -ge 1 ] || die "Missing DIR"
+  setup_runtime
+  (cd "$IMAGEGEN" && python3 scripts/image_project.py --out-dir "$(run_dir_of "$1")" --status 2>&1)
+}
+
+cmd_wait() {
+  [ $# -ge 1 ] || die "Missing DIR"
+  local s="${2:-20}"
+  [ "$s" -gt 25 ] 2>/dev/null && s=25
+  sleep "$s"
+  cmd_status "$1"
+}
+
+cmd_finish() {
+  [ $# -ge 1 ] || die "Missing DIR"
+  local dir="$1" name="" open=0
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in --open) open=1 ;; *) name="$1" ;; esac
+    shift
+  done
+  local run status
+  run="$(run_dir_of "$dir")"
+  status="$(cmd_status "$dir")"
+  printf '%s' "$status" | OUT="$dir" RUN="$run" NAME="$name" OPEN="$open" python3 -c '
+import json, os, subprocess, sys
+raw = sys.stdin.read()
+try:
+    st = json.loads(raw[raw.index("{"):])
+except Exception:
+    print(json.dumps({"status": "error", "message": "unreadable status", "raw": raw[-500:]})); sys.exit(1)
+if st.get("status") != "complete":
+    print(json.dumps({"status": st.get("status", "unknown"), "message": "not finished yet", "errors": st.get("errors", {})})); sys.exit(2)
+out, run, name = os.environ["OUT"], os.environ["RUN"], os.environ["NAME"]
+done = st.get("completed", {})
+files = []
+for job_id, info in done.items():
+    png = os.path.join(run, info["path"])
+    base = name if (name and len(done) == 1) else (f"{name}-{job_id}" if name else job_id)
+    jpg = os.path.join(out, base + ".jpg")
+    subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "85", png, "--out", jpg],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    dims = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", jpg],
+                          capture_output=True, text=True).stdout.split()
+    w = dims[dims.index("pixelWidth:") + 1] if "pixelWidth:" in dims else None
+    h = dims[dims.index("pixelHeight:") + 1] if "pixelHeight:" in dims else None
+    files.append({"id": job_id, "png": png, "jpg": jpg, "width": w, "height": h})
+if os.environ.get("OPEN") == "1" and files:
+    target = files[0]["jpg"] if len(files) == 1 else os.path.join(run, "index.html")
+    subprocess.run(["open", target], check=False)
+print(json.dumps({"status": "complete", "files": files, "gallery": os.path.join(run, "index.html")}, ensure_ascii=False))
+'
+}
+
+case "${1:-}" in
+  generate) shift; cmd_generate "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  wait) shift; cmd_wait "$@" ;;
+  finish) shift; cmd_finish "$@" ;;
+  doctor) shift; exec "$ROOT/scripts/doctor.sh" "$@" ;;
+  version) echo "codex-image 1.0.0" ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 1 ;;
+esac

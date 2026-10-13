@@ -1,0 +1,116 @@
+--- a/scripts/run_codex_imagegen.py
++++ b/scripts/run_codex_imagegen.py
+@@ -11,6 +11,7 @@
+ import subprocess
+ import sys
+ import tempfile
++import time
+ 
+ 
+ MAX_PROMPT_BYTES = 64 * 1024
+@@ -234,6 +235,62 @@
+     return paths
+ 
+ 
++
++def snapshot_generated(generated_root: Path) -> dict[Path, float]:
++    """PNG files already present under generated_root, with their modification time."""
++    if not generated_root.is_dir():
++        return {}
++    known: dict[Path, float] = {}
++    for candidate in generated_root.rglob("*.png"):
++        try:
++            if candidate.is_file() and not candidate.is_symlink():
++                known[candidate.resolve()] = candidate.stat().st_mtime
++        except OSError:
++            continue
++    return known
++
++
++def recover_generated_paths(
++    generated_root: Path, before: dict[Path, float], started_at: float, limit: int
++) -> list[Path]:
++    """Fallback: PNG files that appeared under generated_root during this run.
++
++    Codex CLI 0.162 does not always honour `--output-schema`: the image is
++    generated, but the last message does not contain the expected path. Rather
++    than failing on a successful generation, the file is recovered by its date.
++    The guarantees that matter are kept: the file must live under
++    generated_root, be a real PNG, and have appeared after the launch.
++
++    Limit: files are identified by date, so two simultaneous runs could swap
++    images. Run batches sequentially (`--workers 1`, one plan at a time).
++    """
++    if not generated_root.is_dir():
++        return []
++    fresh: list[tuple[float, Path]] = []
++    for candidate in generated_root.rglob("*.png"):
++        try:
++            if not candidate.is_file() or candidate.is_symlink():
++                continue
++            resolved = candidate.resolve()
++            resolved.relative_to(generated_root)
++            mtime = resolved.stat().st_mtime
++        except (OSError, ValueError):
++            continue
++        if resolved in before and before[resolved] >= mtime:
++            continue
++        if mtime + 1.0 < started_at:
++            continue
++        try:
++            with resolved.open("rb") as file:
++                if file.read(8) != b"\x89PNG\r\n\x1a\n":
++                    continue
++        except OSError:
++            continue
++        fresh.append((mtime, resolved))
++    fresh.sort()
++    return [path for _, path in fresh[-limit:]]
++
++
+ def main() -> None:
+     args = parse_args()
+     if args.timeout <= 0:
+@@ -247,6 +304,8 @@
+     images = resolve_images(args.image)
+     codex_root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
+     generated_root = (codex_root / "generated_images").resolve()
++    before = snapshot_generated(generated_root)
++    started_at = time.time()
+ 
+     with tempfile.TemporaryDirectory(prefix="codex-imagegen-") as temp_dir:
+         temp_root = Path(temp_dir)
+@@ -346,15 +405,29 @@
+             suffix = f": {detail}" if detail else ""
+             fail(f"codex exited with status {completed.returncode}{suffix}", completed.returncode)
+ 
+-        if not last_message.is_file():
+-            fail("codex did not write the structured result file")
+-        result_text = last_message.read_text(encoding="utf-8", errors="strict")
++        result_text = ""
++        if last_message.is_file():
++            result_text = last_message.read_text(encoding="utf-8", errors="strict")
+ 
+     generated_paths = extract_generated_paths(result_text, generated_root)
+     if not generated_paths:
++        # One image per call: the launcher is invoked once per requested image and
++        # the relay instructions forbid producing more. When several PNG files
++        # appear, they are successive attempts by the relay; the last one written
++        # is the one it kept.
++        generated_paths = recover_generated_paths(generated_root, before, started_at, limit=1)
++        if generated_paths:
++            print(
++                "run_codex_imagegen.py: codex did not return the declared JSON paths "
++                "(known behaviour of CLI 0.162); recovered "
++                f"the most recent new PNG written under {generated_root} "
++                "during this run",
++                file=sys.stderr,
++            )
++    if not generated_paths:
+         fail(
+             "codex did not return an existing PNG under "
+-            f"{generated_root}; refusing to copy an untrusted path"
++            f"{generated_root}, and no new PNG appeared there during this run"
+         )
+ 
+     for path in generated_paths:
